@@ -1,6 +1,6 @@
 .env
 chroma_db/
-session.db
+sessions.db
 __pycache__/
 node_modules/
 .venv/
