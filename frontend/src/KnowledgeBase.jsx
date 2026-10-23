@@ -4,11 +4,13 @@ import "./KnowledgeBase.css";
 
 const API_URL = "http://127.0.0.1:8000";
 
-export default function KnowledgeBase() {
+export default function KnowledgeBase({ sessionId = "" }) {
   const fileInput = useRef(null);
+
   const [files, setFiles] = useState([]);
   const [chunkCount, setChunkCount] = useState(null);
   const [message, setMessage] = useState("");
+  const [answer, setAnswer] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [query, setQuery] = useState("");
@@ -17,9 +19,16 @@ export default function KnowledgeBase() {
 
   async function refreshStatus() {
     try {
-      const response = await fetch(`${API_URL}/knowledge-base/status`);
-      if (!response.ok) throw new Error("Could not load knowledge-base status.");
+      const response = await fetch(
+        `${API_URL}/knowledge-base/status`
+      );
+
       const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error("Could not load knowledge-base status.");
+      }
+
       setChunkCount(data.stored_chunks);
     } catch {
       setChunkCount(null);
@@ -46,6 +55,15 @@ export default function KnowledgeBase() {
       return;
     }
 
+    const oversizedFile = selectedFiles.find(
+      (file) => file.size > 20 * 1024 * 1024
+    );
+
+    if (oversizedFile) {
+      setError("Each PDF must be 20 MB or smaller.");
+      return;
+    }
+
     setLoading(true);
     setError("");
     setMessage("");
@@ -57,12 +75,15 @@ export default function KnowledgeBase() {
         const formData = new FormData();
         formData.append("file", file);
 
-        const response = await fetch(`${API_URL}/knowledge-base/upload`, {
-          method: "POST",
-          body: formData,
-        });
+        const response = await fetch(
+          `${API_URL}/knowledge-base/upload`,
+          {
+            method: "POST",
+            body: formData,
+          }
+        );
 
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
 
         if (!response.ok) {
           throw new Error(
@@ -75,14 +96,17 @@ export default function KnowledgeBase() {
         setFiles((current) => [
           {
             name: data.filename || file.name,
-            chunks: data.chunks_stored,
+            chunks: data.chunks_stored ?? 0,
             status: "Uploaded",
           },
-          ...current.filter((item) => item.name !== file.name),
+          ...current.filter(
+            (item) => item.name !== (data.filename || file.name)
+          ),
         ]);
       }
 
       await refreshStatus();
+
       setMessage(
         `${uploaded} PDF file${uploaded === 1 ? "" : "s"} uploaded and processed successfully.`
       );
@@ -98,6 +122,7 @@ export default function KnowledgeBase() {
     event.preventDefault();
     setError("");
     setMessage("");
+    setAnswer("");
     setResults([]);
 
     if (!query.trim()) {
@@ -108,22 +133,37 @@ export default function KnowledgeBase() {
     setSearching(true);
 
     try {
-      const response = await fetch(`${API_URL}/knowledge-base/search`, {
+      const isManualSession = Boolean(sessionId);
+
+      const endpoint = isManualSession
+        ? `/sessions/${encodeURIComponent(sessionId)}/manual-answer`
+        : "/knowledge-base/search";
+
+      const body = isManualSession
+        ? { question: query.trim() }
+        : { query: query.trim(), top_k: 3 };
+
+      const response = await fetch(`${API_URL}${endpoint}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: query.trim(), top_k: 3 }),
+        body: JSON.stringify(body),
       });
 
-      const data = await response.json();
+      const data = await response.json().catch(() => ({}));
 
       if (!response.ok) {
         throw new Error(data.detail || "Knowledge search failed.");
       }
 
       setResults(data.results || []);
+      setAnswer(data.answer || "");
 
       if (!data.results?.length) {
-        setMessage("No relevant chunks found. Try another customer message.");
+        setMessage(
+          "No relevant chunks found. Try another customer message."
+        );
+      } else if (isManualSession) {
+        setMessage("Your question and answer have been saved to the session.");
       }
     } catch (err) {
       setError(
@@ -143,7 +183,14 @@ export default function KnowledgeBase() {
           <p>
             Upload support documents and retrieve relevant information.
           </p>
+          {sessionId && (
+            <p>
+              <strong>Active Manual session:</strong>{" "}
+              {sessionId}
+            </p>
+          )}
         </div>
+
         <button
           className="kb-button kb-primary"
           onClick={refreshStatus}
@@ -169,7 +216,9 @@ export default function KnowledgeBase() {
           disabled={loading}
         >
           <span className="kb-upload-icon">↑</span>
-          <strong>{loading ? "Processing documents..." : "Choose PDF files"}</strong>
+          <strong>
+            {loading ? "Processing documents..." : "Choose PDF files"}
+          </strong>
           <span>Click to browse · PDF format · Maximum 20 MB per file</span>
           <span className="kb-browse">Browse files</span>
         </button>
@@ -186,15 +235,16 @@ export default function KnowledgeBase() {
         {files.length > 0 && (
           <div className="kb-file-list">
             <h3>Uploaded in this visit</h3>
+
             {files.map((file) => (
               <div className="kb-file-row" key={file.name}>
                 <span className="kb-pdf-icon">PDF</span>
+
                 <div className="kb-file-info">
                   <strong>{file.name}</strong>
-                  <span>
-                    {file.chunks} chunks added
-                  </span>
+                  <span>{file.chunks} chunks added</span>
                 </div>
+
                 <span className="kb-status">{file.status}</span>
               </div>
             ))}
@@ -213,6 +263,7 @@ export default function KnowledgeBase() {
                 : "Chunks currently stored in the knowledge base"}
             </span>
           </div>
+
           <span className="kb-database-icon">▤</span>
         </div>
       </section>
@@ -221,32 +272,52 @@ export default function KnowledgeBase() {
         <div className="kb-section-title">
           <span className="kb-section-icon">02</span>
           <div>
-            <h2>Test knowledge retrieval</h2>
+            <h2>
+              {sessionId
+                ? "Manual customer message"
+                : "Test knowledge retrieval"}
+            </h2>
             <p>
-              Search the uploaded documents using a customer message.
+              {sessionId
+                ? "Submit a customer message for this saved Manual session."
+                : "Search uploaded documents using a customer message."}
             </p>
           </div>
         </div>
 
         <form className="kb-search-form" onSubmit={handleSearch}>
-          <label htmlFor="customer-query">
-            Customer message
-          </label>
+          <label htmlFor="customer-query">Customer message</label>
+
           <textarea
             id="customer-query"
             rows={3}
             value={query}
             onChange={(event) => setQuery(event.target.value)}
             placeholder="Example: My order is delayed. How can I get an update?"
+            maxLength={5000}
           />
+
           <button
             className="kb-button kb-primary"
             type="submit"
             disabled={searching}
           >
-            {searching ? "Searching..." : "Find relevant chunks →"}
+            {searching
+              ? "Searching..."
+              : sessionId
+              ? "Submit customer message →"
+              : "Find relevant chunks →"}
           </button>
         </form>
+
+        {answer && (
+          <div className="kb-result-card">
+            <div className="kb-results-heading">
+              <h3>Generated answer</h3>
+            </div>
+            <p>{answer}</p>
+          </div>
+        )}
 
         {results.length > 0 && (
           <div className="kb-results">
@@ -264,14 +335,23 @@ export default function KnowledgeBase() {
                   <span className="kb-result-number">
                     {String(index + 1).padStart(2, "0")}
                   </span>
-                  <strong>{item.filename || item.source || "Unknown source"}</strong>
+
+                  <strong>
+                    {item.filename || item.source || "Unknown source"}
+                  </strong>
+
                   {item.chunk_index !== undefined && (
                     <span className="kb-chunk-index">
                       Chunk {item.chunk_index}
                     </span>
                   )}
                 </div>
-                <p>{item.text || item.content || "No chunk text returned."}</p>
+
+                <p>
+                  {item.text ||
+                    item.content ||
+                    "No chunk text returned."}
+                </p>
               </article>
             ))}
           </div>

@@ -344,13 +344,12 @@ def answer_manual_session(session_id: str, request: ManualAnswerRequest):
     "session_id": session_id,
     "mode": "Manual",
     "question": request.question,
-    "results": result["relevant_results"],
-    "result_count": len(result["relevant_results"]),
+    "results": matches[:3],
+    "result_count": len(matches[:3]),
     "answer": result["answer"],
-    "sources": result["sources"],
+    "sources": result.get("sources", []),
     "session": updated,
 }
-
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:

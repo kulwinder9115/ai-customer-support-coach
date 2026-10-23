@@ -1,4 +1,3 @@
-
 from pathlib import Path
 from uuid import uuid4
 import re
@@ -15,16 +14,15 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CHROMA_DIR = PROJECT_ROOT / "chroma_db"
 
 MAX_CHUNKS_PER_PDF = 5000
-CHUNK_SIZE = 800
-CHUNK_OVERLAP = 120
+CHUNK_SIZE = 1500
+CHUNK_OVERLAP = 400
 
-# Cosine distance is a distance measure, not a probability.
-# Lexical matching is also used so relevant policy terms can be recovered.
 MAX_RELEVANCE_DISTANCE = 1.0
 MIN_LEXICAL_OVERLAP = 2
 
 chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
 
+# Keep the original collection name for compatibility with existing data.
 collection = chroma_client.get_or_create_collection(
     name="support_knowledge",
     metadata={"hnsw:space": "cosine"},
@@ -89,7 +87,7 @@ def split_into_chunks(
     if chunk_size < 1 or overlap < 0 or overlap >= chunk_size:
         raise ValueError("Invalid chunking configuration.")
 
-    text = text.strip()
+    text = re.sub(r"\s+", " ", text).strip()
 
     if not text:
         return []
@@ -149,11 +147,13 @@ def add_pdf_to_knowledge_base(pdf_path):
     source = pdf_path.name
     new_ids = [str(uuid4()) for _ in chunks]
 
-    old_records = collection.get(where={"source": source})
+    old_records = collection.get(
+        where={"source": source},
+        include=["metadatas"],
+    )
     old_ids = old_records.get("ids", [])
 
-    # Store new chunks before deleting the old version.
-    # If insertion fails, remove any partially inserted new chunks.
+    # Insert new chunks in batches before removing the old version.
     batch_size = 100
 
     try:
@@ -200,7 +200,8 @@ STOP_WORDS = {
     "if", "then", "than", "as", "do", "does", "did", "have",
     "has", "had", "can", "could", "would", "should", "will",
     "please", "help", "want", "need", "got", "get", "received",
-    "my", "me", "there", "here", "what", "which", "who", "how",
+    "there", "here", "what", "which", "who", "how",
+    "me", "about", "tell", "explain",
 }
 
 SYNONYMS = {
@@ -209,15 +210,54 @@ SYNONYMS = {
     "mistaken": "incorrect",
     "parcel": "delivery",
     "package": "delivery",
-    "shipment": "delivery",
-    "bought": "ordered",
+    "shipment": "ship",
+    "shipping": "ship",
+    "shipped": "ship",
+    "bought": "order",
     "purchase": "order",
     "purchased": "order",
+    "orders": "order",
     "refunds": "refund",
     "refunded": "refund",
+    "refunding": "refund",
     "returns": "return",
+    "returned": "return",
+    "returning": "return",
     "replacement": "replace",
     "replacements": "replace",
+    "cancelled": "cancel",
+    "canceled": "cancel",
+    "cancelling": "cancel",
+    "canceling": "cancel",
+    "cancellation": "cancel",
+    "cancellations": "cancel",
+    "packing": "pack",
+    "packed": "pack",
+    "carrier": "ship",
+    "handoff": "ship",
+    "fees": "fee",
+    "orders": "order",
+}
+
+# Extra terms help retrieve relevant policy passages when a short
+# question uses different words from the document.
+QUERY_EXPANSIONS = {
+    "cancel": {
+        "cancellation", "order", "pack", "ship",
+        "carrier", "fee", "pending", "eligible",
+    },
+    "refund": {
+        "return", "payment", "money", "eligible",
+    },
+    "return": {
+        "refund", "replacement", "eligible", "delivery",
+    },
+    "delivery": {
+        "ship", "carrier", "tracking", "order",
+    },
+    "address": {
+        "delivery", "ship", "carrier", "change",
+    },
 }
 
 
@@ -235,36 +275,66 @@ def _normalise_tokens(text):
     return tokens
 
 
+def _expanded_query_tokens(query):
+    tokens = _normalise_tokens(query)
+    expanded = set(tokens)
+
+    for token in tokens:
+        expanded.update(QUERY_EXPANSIONS.get(token, set()))
+
+    return expanded
+
+
 def _lexical_overlap(query, document):
     query_tokens = _normalise_tokens(query)
+    expanded_tokens = _expanded_query_tokens(query)
     document_tokens = _normalise_tokens(document)
 
     if not query_tokens or not document_tokens:
         return 0, 0.0
 
-    overlap = query_tokens.intersection(document_tokens)
+    # Count original matches and expanded policy-term matches.
+    original_overlap = query_tokens.intersection(document_tokens)
+    expanded_overlap = expanded_tokens.intersection(document_tokens)
 
-    return len(overlap), len(overlap) / len(query_tokens)
+    overlap_count = max(
+        len(original_overlap),
+        len(expanded_overlap),
+    )
+
+    # Keep the ratio bounded between 0 and 1.
+    overlap_ratio = min(
+        1.0,
+        overlap_count / max(len(query_tokens), 1),
+    )
+
+    return overlap_count, overlap_ratio
 
 
 def _is_relevant(query, document, distance):
-    """
-    Use both semantic distance and lexical overlap.
-
-    This prevents a relevant policy passage from being rejected
-    solely because its cosine distance is slightly above 0.68.
-    Lexical overlap alone cannot establish that a policy authorizes
-    a refund, replacement, or other action.
-    """
     if distance is None or distance > MAX_RELEVANCE_DISTANCE:
         return False
 
-    overlap_count, overlap_ratio = _lexical_overlap(query, document)
+    original_tokens = _normalise_tokens(query)
+    expanded_tokens = _expanded_query_tokens(query)
+    document_tokens = _normalise_tokens(document)
 
-    return (
-        overlap_count >= MIN_LEXICAL_OVERLAP
-        and overlap_ratio >= 0.30
-    )
+    if not document_tokens:
+        return False
+
+    original_overlap = original_tokens.intersection(document_tokens)
+    expanded_overlap = expanded_tokens.intersection(document_tokens)
+
+    # Exact keyword matches remain the strongest lexical signal.
+    if len(original_overlap) >= MIN_LEXICAL_OVERLAP:
+        return True
+
+    # Allow short policy questions to match passages using related
+    # policy terms, such as packing, carrier handoff, and cancellation.
+    if len(expanded_overlap) >= MIN_LEXICAL_OVERLAP:
+        return True
+
+    return False
 
 
 # ---------- Knowledge-base search ----------
@@ -294,8 +364,8 @@ def search_knowledge_base(query, top_k=3):
         convert_to_numpy=True,
     ).tolist()
 
-    # Retrieve additional candidates before relevance filtering.
-    candidate_count = min(max(top_k * 5, 10), total_chunks)
+    # Search a larger pool before applying relevance filtering.
+    candidate_count = min(max(top_k * 20, 50), total_chunks)
 
     results = collection.query(
         query_embeddings=[query_embedding],
@@ -307,13 +377,16 @@ def search_knowledge_base(query, top_k=3):
     metadatas = results.get("metadatas") or [[]]
     distances = results.get("distances") or [[]]
 
-    candidates = []
-
     result_documents = documents[0] if documents else []
     result_metadatas = metadatas[0] if metadatas else []
     result_distances = distances[0] if distances else []
 
+    candidates = []
+
     for index, document in enumerate(result_documents):
+        if not document:
+            continue
+
         metadata = (
             result_metadatas[index]
             if index < len(result_metadatas)
@@ -327,10 +400,10 @@ def search_knowledge_base(query, top_k=3):
             else None
         )
 
-        relevant = _is_relevant(query, document, distance)
         overlap_count, overlap_ratio = _lexical_overlap(query, document)
+        relevant = _is_relevant(query, document, distance)
 
-        # Chroma cosine distance is not a calibrated probability.
+        # Cosine distance is not a calibrated probability.
         relevance_score = (
             max(0.0, min(1.0, 1.0 - distance))
             if distance is not None
@@ -349,23 +422,21 @@ def search_knowledge_base(query, top_k=3):
             "lexical_overlap_ratio": round(overlap_ratio, 4),
             "is_relevant": relevant,
             "relevance_status": (
-                "relevant"
-                if relevant
-                else "weak_match_check_policy"
+                "relevant" if relevant else "weak_match_check_policy"
             ),
         })
 
-    # Never pass weak matches forward as trusted policy evidence.
     relevant_candidates = [
-        candidate
-        for candidate in candidates
+        candidate for candidate in candidates
         if candidate["is_relevant"]
     ]
 
-    # Prefer the closest semantic matches among relevant candidates.
+    # Prefer semantic similarity, then stronger keyword overlap.
     relevant_candidates.sort(
         key=lambda item: (
-            item["distance"] if item["distance"] is not None else float("inf"),
+            item["distance"]
+            if item["distance"] is not None
+            else float("inf"),
             -item["lexical_overlap"],
         )
     )
